@@ -1,17 +1,17 @@
 {
   "sourceName": "serienstream.to (ENG DUB)",
-  "iconUrl": "https://web.archive.org/web/20260903034450/https://git.luna-app.eu/Cufiy/sora-modules/raw/branch/main/modules/serienstream.to/sto.png",
+  "iconUrl": "https://serienstream.to/favicon-96x96.png",
   "author": {
     "name": "Cufiy & Hamzo",
     "icon": "https://files.catbox.moe/ttj4fc.gif",
     "url": "https://github.com/JMcrafter26"
   },
-  "version": "0.4.4",
+  "version": "0.5.0",
   "language": "English (DUB)",
   "streamType": "HLS",
   "quality": "720p",
-  "baseUrl": "https://google.com",
-  "searchBaseUrl": "https://serienstream.to/ajax/seriesSearch?keyword=%s",
+  "baseUrl": "https://serienstream.to",
+  "searchBaseUrl": "https://serienstream.to/suche?term=%s",
   "scriptUrl": "https://raw.githubusercontent.com/xcxcdxdvx-png/Stosoraext/refs/heads/main/stoENG.js",
   "asyncJS": true,
   "streamAsyncJS": false,
