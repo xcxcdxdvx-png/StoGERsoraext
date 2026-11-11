@@ -1259,7 +1259,17 @@ function voeExtractor(html, url = null) {
     collect(result.fallback);
     collect(result.direct_access_url);
 
-    // Prefer HLS because the module is registered as streamType "HLS".
+    // Prefer the direct MP4 download URL. Sora's player cannot start VOE's
+    // HLS master reliably (it shows -00:01 with a crossed-out play button),
+    // while the progressive MP4 streams fine.
+    const mp4Url = candidates.find(function (url) {
+      return /\.mp4(\?|$)/i.test(url) || /\/engine\/download\//i.test(url);
+    });
+    if (mp4Url) {
+      console.log("Voe MP4 Stream URL: " + mp4Url);
+      return mp4Url;
+    }
+    // Fall back to HLS if no MP4 is offered.
     const hlsUrl = candidates.find((url) => /\.m3u8(\?|$)/i.test(url));
     if (hlsUrl) {
       console.log("Voe HLS Stream URL: " + hlsUrl);
