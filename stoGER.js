@@ -1,0 +1,1548 @@
+///////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////       Main Functions          //////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////
+
+const SERIENSTREAM_BASE = 'https://serienstream.to';
+
+async function searchResults(keyword) {
+    try {
+        const encodedKeyword = encodeURIComponent(keyword);
+        const searchApiUrl = SERIENSTREAM_BASE + '/suche?term=' + encodedKeyword;
+        const response = await soraFetch(searchApiUrl);
+        const text = await readText(response);
+
+        const results = [];
+        const seen = {};
+
+        // <a href="/serie/xyz" class="d-block show-cover"> ... <img src="..."> ... </a>
+        // ... <h6 class="show-title ...">Title</h6>
+        const cardRegex = /<a\s+[^>]*href="([^"]+)"[^>]*class="[^"]*\bshow-cover\b[^"]*"[\s\S]*?<img\s+[^>]*src="([^"]+)"[\s\S]*?class="[^"]*\bshow-title\b[^"]*"[^>]*>([\s\S]*?)<\//g;
+        let match;
+        while ((match = cardRegex.exec(text)) !== null) {
+            const href = absoluteUrl(decodeHtml(match[1]));
+            if (!href || seen[href]) continue;
+            seen[href] = true;
+            results.push({
+                title: decodeHtml(stripTags(match[3])).replace(/\s+/g, ' ').trim(),
+                image: absoluteUrl(decodeHtml(match[2])),
+                href: href
+            });
+        }
+
+        console.log('Search Results: ' + JSON.stringify(results));
+        return JSON.stringify(results);
+    } catch (error) {
+        sendLog('Search error: ' + error);
+        return JSON.stringify([]);
+    }
+}
+
+async function extractDetails(url) {
+    try {
+        const response = await soraFetch(url);
+        const text = await readText(response);
+
+        let description = 'No description available';
+        const descriptionMatch = /<span class="description-text"[^>]*>([\s\S]*?)<\/span>/.exec(text);
+        if (descriptionMatch) {
+            description = decodeHtml(stripTags(descriptionMatch[1])).replace(/\s+/g, ' ').trim() || description;
+        }
+
+        // <a class="small text-muted" href="/jahr/1997">1997</a>
+        const yearMatch = /<a class="small text-muted" href="[^"]*\/jahr\/(\d{4})"[^>]*>(\d{4})<\/a>/.exec(text) ||
+            /href="[^"]*\/jahr\/(\d{4})"/.exec(text);
+        const airdate = yearMatch ? yearMatch[1] : 'Unknown Year';
+
+        let genres = '';
+        const genresMatch = /<li class="series-group">\s*<strong class="me-1">Genre:<\/strong>([\s\S]*?)<\/li>/.exec(text);
+        if (genresMatch) {
+            const genreLinksRegex = /href="[^"]*\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/g;
+            let genreMatch;
+            const genreList = [];
+            while ((genreMatch = genreLinksRegex.exec(genresMatch[1])) !== null) {
+                genreList.push(decodeHtml(genreMatch[1]).trim());
+            }
+            genres = genreList.join(', ');
+        }
+
+        return JSON.stringify([{
+            description: description,
+            aliases: genres,
+            airdate: airdate
+        }]);
+    } catch (error) {
+        sendLog('Details error: ' + error);
+        return JSON.stringify([{
+            description: 'Error loading description',
+            aliases: '',
+            airdate: 'Unknown Year'
+        }]);
+    }
+}
+
+async function extractEpisodes(url) {
+    try {
+        const response = await soraFetch(url);
+        const html = await readText(response);
+
+        const seasonLinks = getSeasonLinks(html);
+        sendLog('Season Links: ' + JSON.stringify(seasonLinks));
+
+        const finishedList = [];
+        const chunkSize = 4;
+        for (let i = 0; i < seasonLinks.length; i += chunkSize) {
+            const chunk = seasonLinks.slice(i, i + chunkSize);
+            const chunkResults = await Promise.all(chunk.map(function (seasonLink) {
+                return fetchSeasonEpisodes(seasonLink);
+            }));
+            for (const episodes of chunkResults) {
+                finishedList.push.apply(finishedList, episodes);
+            }
+        }
+        sendLog('Finished Episode List: ' + JSON.stringify(finishedList));
+
+        return JSON.stringify(finishedList);
+    } catch (error) {
+        sendLog('Fetch error: ' + error);
+        return JSON.stringify([]);
+    }
+}
+
+async function extractStreamUrl(url) {
+    try {
+        sendLog('ExtractStreamUrl called with URL: ' + url);
+
+        // 1 = Deutsch, 3 = Ger-Sub, 2 = Englisch, 4 = Eng-Sub
+        const language = [1, 3, 2, 4];
+
+        // Some Sora versions pass the already-downloaded HTML instead of the URL
+        // (streamAsyncJS mode). Support both.
+        const looksLikeHtml = /<\s*(?:!doctype|html|body)\b/i.test(String(url || ''));
+        const html = looksLikeHtml ? String(url) : await readText(await soraFetch(url));
+        const pageUrl = looksLikeHtml ? SERIENSTREAM_BASE : url;
+
+        if (!html || html.indexOf('link-box') === -1) {
+            sendLog('No hoster links found on page');
+            return JSON.stringify({ streams: [] });
+        }
+
+        const csrf = getCsrfToken(html);
+        const videoLinks = getVideoLinks(html);
+
+        const streams = [];
+        for (const lang of language) {
+            const candidates = selectHoster(videoLinks, [lang]);
+            sendLog('Provider List (language ' + lang + '): ' + JSON.stringify(candidates));
+            if (candidates.length === 0) continue;
+
+            for (const candidate of candidates) {
+                if (streams.length >= 6) break;
+                try {
+                    let found = [];
+
+                    if (isRedirectGateUrl(candidate.href)) {
+                        // New site layout: hoster links point at /r?t=<encrypted token>.
+                        // Resolving them requires a POST with the page CSRF token.
+                        const resolved = await resolveRedirectGate(candidate.href, csrf, pageUrl);
+                        if (resolved && resolved.html) {
+                            const providerName = normalizeProvider(candidate.provider, resolved.html);
+                            found = await extractCandidatesFromHtml(resolved.html, resolved.url, providerName);
+                        }
+                        // Fallback: if the gate handed us a real hoster URL, use the
+                        // normal extractor path for it.
+                        if (found.length === 0 && resolved && resolved.url && !isRedirectGateUrl(resolved.url) &&
+                            resolved.url.indexOf(SERIENSTREAM_BASE) !== 0) {
+                            const providerName = normalizeProvider(candidate.provider, resolved.html);
+                            const single = await extractStreamUrlByProvider(resolved.url, providerName);
+                            if (single) {
+                                found = [{ url: single, index: 0, quality: '', format: streamFormat(single) }];
+                            }
+                        }
+                    } else {
+                        const providerName = normalizeProvider(candidate.provider);
+                        const single = await extractStreamUrlByProvider(candidate.href, providerName);
+                        if (single) {
+                            found = [{ url: single, index: 0, quality: '', format: streamFormat(single) }];
+                        }
+                    }
+
+                    // VOE can return several candidates (MP4 + HLS). Add them all so
+                    // the player can fall back when one variant is unavailable.
+                    for (const item of found) {
+                        if (streams.length >= 6) break;
+                        if (!item || !item.url || item.url.indexOf('http') !== 0) continue;
+                        if (streams.some(function (s) { return s.streamUrl === item.url; })) continue;
+                        streams.push({
+                            title: buildStreamTitle(candidate.provider, item, found.length),
+                            streamUrl: item.url
+                        });
+                    }
+                } catch (error) {
+                    sendLog('Error extracting provider ' + candidate.provider + ': ' + error);
+                }
+            }
+
+            // Only fall back to the next language if this one produced nothing.
+            if (streams.length > 0) break;
+        }
+
+        sendLog('Returned Streams: ' + JSON.stringify({ streams: streams }));
+        return JSON.stringify({ streams: streams });
+    } catch (error) {
+        sendLog('ExtractStreamUrl error: ' + error);
+        return JSON.stringify({ streams: [] });
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////       Helper Functions       ////////////////////////////
+////////////////////////////      for ExtractEpisodes     ////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to select hosters by language priority.
+// Returns an array so multiple hosters of the same language are kept.
+function selectHoster(finishedList, preferredLang) {
+    console.log('Hoster List: ' + JSON.stringify(finishedList));
+    for (const lang of preferredLang) {
+        const matches = finishedList.filter(function (video) { return video.language === lang; });
+        if (matches.length > 0) {
+            // de-duplicate by href
+            const seen = {};
+            return matches.filter(function (video) {
+                if (seen[video.href]) return false;
+                seen[video.href] = true;
+                return true;
+            });
+        }
+    }
+    return [];
+}
+
+// Local Debugging function to send logs
+async function sendLog(message) {
+    console.log(message);
+    return;
+}
+
+// Helper function to get the list of seasons
+// Site specific structure
+function getSeasonLinks(html) {
+    const seasonLinks = [];
+    const seasonRegex = /<nav[^>]*id="season-nav"[^>]*>[\s\S]*?<ul[^>]*class="[^"]*list-items-nav[^"]*"[^>]*>([\s\S]*?)<\/ul>/;
+    const seasonMatch = seasonRegex.exec(html);
+    if (seasonMatch) {
+        const seasonLinkRegex = /<a\s+[^>]*?href="([^"]+)"[^>]*?class="[^"]*alphabet-link/g;
+        let seasonLinkMatch;
+        const filmeLinks = [];
+        while ((seasonLinkMatch = seasonLinkRegex.exec(seasonMatch[1])) !== null) {
+            const seasonLink = decodeHtml(seasonLinkMatch[1]);
+            if (seasonLink.indexOf('/filme') !== -1 || seasonLink.indexOf('staffel-0') !== -1) {
+                filmeLinks.push(seasonLink);
+            } else {
+                seasonLinks.push(seasonLink);
+            }
+        }
+        seasonLinks.push.apply(seasonLinks, filmeLinks);
+    }
+
+    return seasonLinks.map(absoluteUrl);
+}
+
+// Helper function to fetch episodes for a season
+// Site specific structure
+async function fetchSeasonEpisodes(url) {
+    try {
+        const response = await soraFetch(url);
+        const text = await readText(response);
+
+        const episodeList = [];
+        const episodeDivRegex = /<nav[^>]*id="episode-nav"[^>]*>[\s\S]*?<ul[^>]*class="[^"]*list-items-nav[^"]*"[^>]*>([\s\S]*?)<\/ul>/;
+        const episodeDivMatch = episodeDivRegex.exec(text);
+        if (episodeDivMatch) {
+            const episodeLinkRegex = /<a\s+[^>]*?href="([^"]+)"[^>]*?class="[^"]*alphabet-link[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/a>/g;
+            let episodeLinkMatch;
+            let number = 0;
+            while ((episodeLinkMatch = episodeLinkRegex.exec(episodeDivMatch[1])) !== null) {
+                const episodeLink = decodeHtml(episodeLinkMatch[1]);
+                number += 1;
+                episodeList.push({ number: number, href: absoluteUrl(episodeLink) });
+            }
+            console.log('Episode List for season ' + url + ': ' + JSON.stringify(episodeList));
+        }
+
+        return episodeList;
+    } catch (error) {
+        sendLog('FetchSeasonEpisodes helper function error: ' + error);
+        return [];
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////       Helper Functions       //////////////////////////
+////////////////////////////      for ExtractStreamUrl    //////////////////////////
+///////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the video links.
+// Attribute order on the site is not stable, so parse each <button> tag individually.
+function getVideoLinks(html) {
+    const videoLinks = [];
+    const buttonRegex = /<button\b[^>]*>/gi;
+    let match;
+    while ((match = buttonRegex.exec(html)) !== null) {
+        const tag = match[0];
+        if (tag.indexOf('data-play-url') === -1) continue;
+
+        const href = getAttribute(tag, 'data-play-url');
+        const provider = getAttribute(tag, 'data-provider-name') || 'unknown';
+        const language = parseInt(getAttribute(tag, 'data-language-id') || '0', 10) || 0;
+        if (!href) continue;
+
+        videoLinks.push({
+            href: absoluteUrl(decodeHtml(href)),
+            provider: provider.toLowerCase(),
+            language: language
+        });
+    }
+
+    console.log('Video Links: ' + JSON.stringify(videoLinks));
+    return videoLinks;
+}
+
+function getAttribute(tag, name) {
+    let re = new RegExp('\\b' + name + '\\s*=\\s*"([^"]*)"', 'i');
+    let match = re.exec(tag);
+    if (!match) {
+        re = new RegExp("\\b" + name + "\\s*=\\s*'([^']*)'", 'i');
+        match = re.exec(tag);
+    }
+    return match ? match[1] : null;
+}
+
+function getCsrfToken(html) {
+    let match = /<meta[^>]*name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i.exec(html);
+    if (!match) match = /<meta[^>]*content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i.exec(html);
+    if (!match) match = /<input[^>]*name=["']_token["'][^>]*value=["']([^"']+)["']/i.exec(html);
+    return match ? decodeHtml(match[1]) : '';
+}
+
+function isRedirectGateUrl(url) {
+    return /\/r\?[^#]*\bt=/.test(String(url || ''));
+}
+
+// Resolve a /r?t=... link into the real hoster page.
+// 1. POST the token + CSRF token to /r
+// 2. Follow the JavaScript/meta redirects of the returned page (VOE rotates
+//    through a large number of domains, so this cannot be hardcoded).
+async function resolveRedirectGate(playUrl, csrf, referer, allowRetry) {
+    const tokenMatch = /[?&]t=([^&#]+)/.exec(playUrl);
+    if (!tokenMatch) return null;
+
+    let token = tokenMatch[1];
+    try { token = decodeURIComponent(token); } catch (e) { }
+
+    const body = '_token=' + encodeURIComponent(csrf) + '&t=' + encodeURIComponent(token);
+    const response = await soraFetch(SERIENSTREAM_BASE + '/r', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Referer': referer,
+            'Origin': SERIENSTREAM_BASE
+        },
+        body: body
+    });
+
+    // Laravel session expired / CSRF mismatch: refresh the episode page once to
+    // get a fresh session cookie + token and try again.
+    if (allowRetry !== false && response && response.status === 419) {
+        const freshHtml = await readText(await soraFetch(referer));
+        const freshCsrf = getCsrfToken(freshHtml);
+        if (freshCsrf) return resolveRedirectGate(playUrl, freshCsrf, referer, false);
+    }
+
+    let html = await readText(response);
+    let currentUrl = SERIENSTREAM_BASE + '/r';
+
+    for (let hop = 0; hop < 6; hop++) {
+        const next = extractClientRedirect(html, currentUrl);
+        if (!next || next === currentUrl) break;
+        // Never follow the bridge page back to the homepage.
+        if (next === SERIENSTREAM_BASE || next === SERIENSTREAM_BASE + '/') break;
+
+        const followResponse = await soraFetch(next, {
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Referer': referer
+            }
+        });
+        const followedHtml = await readText(followResponse);
+        if (!followedHtml) break;
+
+        html = followedHtml;
+        currentUrl = next;
+    }
+
+    return { html: html, url: currentUrl };
+}
+
+function extractClientRedirect(html, baseUrl) {
+    if (!html) return null;
+
+    const patterns = [
+        /<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"']+)["']/i,
+        /window\.location\.(?:href|replace|assign)\s*(?:=\s*|\()\s*["']([^"']+)["']/i,
+        /(?:top|parent)\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+        /window\.location\s*=\s*["']([^"']+)["']/i
+    ];
+
+    for (const pattern of patterns) {
+        const match = pattern.exec(html);
+        if (match && match[1]) {
+            const target = absoluteUrl(unescapeUrl(match[1]), baseUrl);
+            if (target && target.indexOf('http') === 0) return target;
+        }
+    }
+    return null;
+}
+
+// http:// or https:// or //host/... or /path
+function absoluteUrl(url, baseUrl) {
+    url = decodeHtml(String(url || '')).trim();
+    if (!url) return '';
+    if (url.indexOf('//') === 0) return 'https:' + url;
+    if (url.indexOf('http://') === 0 || url.indexOf('https://') === 0) return url;
+
+    let base = baseUrl || SERIENSTREAM_BASE;
+    const baseMatch = /^(https?:\/\/[^\/]+)/.exec(base);
+    if (url.charAt(0) === '/') {
+        return (baseMatch ? baseMatch[1] : SERIENSTREAM_BASE) + url;
+    }
+    return base + '/' + url;
+}
+
+function unescapeUrl(url) {
+    return decodeHtml(String(url || ''))
+        .replace(/\\u002[fF]/g, '/')
+        .replace(/\\u0026/g, '&')
+        .replace(/\\x2[fF]/g, '/')
+        .replace(/\\x26/g, '&')
+        .replace(/\\\//g, '/')
+        .trim();
+}
+
+function decodeHtml(text) {
+    return String(text || '')
+        .replace(/&#x([0-9a-f]+);/gi, function (_, hex) { return String.fromCharCode(parseInt(hex, 16)); })
+        .replace(/&#([0-9]+);/g, function (_, dec) { return String.fromCharCode(parseInt(dec, 10)); })
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0*39;/g, "'")
+        .replace(/&apos;/gi, "'")
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&amp;/gi, '&');
+}
+
+function stripTags(text) {
+    return String(text || '').replace(/<[^>]*>/g, '');
+}
+
+function normalizeProvider(provider, html) {
+    const raw = String(provider || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    const map = [
+        ['voe', 'voe'],
+        ['vidoza', 'vidoza'],
+        ['vidmoly', 'vidmoly'],
+        ['dood', 'doodstream'],
+        ['streamtape', 'streamtape'],
+        ['sibnet', 'sibnet'],
+        ['mp4upload', 'mp4upload'],
+        ['sendvid', 'sendvid'],
+        ['uqload', 'uqload'],
+        ['earnvids', 'earnvids'],
+        ['videospk', 'videospk'],
+        ['packer', 'packer']
+    ];
+    for (const entry of map) {
+        if (raw.indexOf(entry[0]) !== -1) return entry[1];
+    }
+
+    // Detect by page content (VOE rotates domains constantly).
+    if (html) {
+        if (/<title>[^<]*-\s*VOE\b/i.test(html)) return 'voe';
+        if (/<meta[^>]*name=["']keywords["'][^>]*content=["'][^"']*VOE/i.test(html)) return 'voe';
+        if (/"direct_access_url"\s*:/.test(html) && /"file_code"\s*:/.test(html)) return 'voe';
+    }
+    return raw;
+}
+
+function prettyProvider(provider) {
+    const name = String(provider || 'Stream').toLowerCase();
+    if (name === 'voe' || name.indexOf('voe') === 0) return 'VOE';
+    if (name === 'streamtape') return 'Streamtape';
+    if (name === 'vidoza') return 'Vidoza';
+    if (name === 'vidmoly') return 'Vidmoly';
+    if (name === 'doodstream') return 'DoodStream';
+    if (name === 'mp4upload') return 'MP4Upload';
+    return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+// Extract a stream from an already fetched hoster page.
+async function extractFromHtml(html, url, provider) {
+    switch (provider) {
+        case 'voe': return voeExtractor(html, url);
+        case 'vidoza': return vidozaExtractor(html, url);
+        case 'vidmoly': return await vidmolyExtractor(html, url);
+        case 'doodstream': return await doodstreamExtractor(html, url);
+        case 'mp4upload': return await mp4uploadExtractor(html, url);
+        case 'sendvid': return await sendvidExtractor(html, url);
+        case 'sibnet': return await sibnetExtractor(html, url);
+        case 'streamtape': return await streamtapeExtractor(html, url);
+        case 'uqload': return await uqloadExtractor(html, url);
+        case 'earnvids': return await earnvidsExtractor(html, url);
+        case 'videospk': return await videospkExtractor(html, url);
+        case 'packer': return await packerExtractor(html, url);
+        default: return null;
+    }
+}
+
+// Returns every playable candidate for a provider (VOE can expose several).
+// Each item: { url, index, quality, format }
+async function extractCandidatesFromHtml(html, url, provider) {
+    if (provider === 'voe') {
+        return voeExtractStreams(html, url);
+    }
+    const single = await extractFromHtml(html, url, provider);
+    if (!single) return [];
+    if (Array.isArray(single)) {
+        return single
+            .map(function (value, index) {
+                const streamUrl = (value && typeof value === 'object') ? value.streamUrl : value;
+                if (!streamUrl) return null;
+                return { url: streamUrl, index: index, quality: '', format: streamFormat(streamUrl) };
+            })
+            .filter(Boolean);
+    }
+    if (typeof single === 'string') {
+        return [{ url: single, index: 0, quality: '', format: streamFormat(single) }];
+    }
+    return [];
+}
+
+function streamFormat(url) {
+    const value = String(url || '');
+    if (isMp4Url(value)) return 'MP4';
+    if (/\.m3u8(?:\?|$)/i.test(value)) return 'HLS';
+    return '';
+}
+
+// "VOE MP4 (720p) 1" / "VOE HLS (720p) 2" / "VOE MP4"
+function buildStreamTitle(provider, item, count) {
+    const name = prettyProvider(provider);
+    let label = name;
+    if (item.format) label += ' ' + item.format;
+    if (item.quality) label += ' (' + item.quality + ')';
+    if (count > 1) label += ' ' + ((item.index || 0) + 1);
+    return label;
+}
+
+// Returns the response body as a string for both fetchv2 response objects and
+// the legacy fetch() string return value.
+async function readText(response) {
+    if (response === null || response === undefined) return '';
+    try {
+        if (typeof response.text === 'function') return await response.text();
+    } catch (error) {
+        sendLog('readText error: ' + error);
+    }
+    if (typeof response === 'string') return response;
+    return '';
+}
+
+
+// ⚠️ DO NOT EDIT BELOW THIS LINE ⚠️
+// EDITING THIS FILE COULD BREAK THE UPDATER AND CAUSE ISSUES WITH THE EXTRACTOR
+
+/* {GE START} */
+/* {VERSION: 1.2.3} */
+
+/**
+ * @name global_extractor.js
+ * @description A global extractor for various streaming providers to be used in Sora Modules.
+ * @author Cufiy
+ * @url https://github.com/JMcrafter26/sora-global-extractor
+ * @license CUSTOM LICENSE - see https://github.com/JMcrafter26/sora-global-extractor/blob/main/LICENSE
+ * @date 2026-06-18 04:12:29
+ * @version 1.2.3
+ * @note This file was generated automatically.
+ * The global extractor comes with an auto-updating feature, so you can always get the latest version. https://github.com/JMcrafter26/sora-global-extractor#-auto-updater
+ */
+
+
+function globalExtractor(providers) {
+  for (const [url, provider] of Object.entries(providers)) {
+    try {
+      const streamUrl = extractStreamUrlByProvider(url, provider);
+      // check if streamUrl is an object with streamUrl property
+      if (streamUrl && typeof streamUrl === "object" && !Array.isArray(streamUrl) && streamUrl.streamUrl) {
+        return streamUrl.streamUrl;
+      }
+      // check if streamUrl is not null, a string, and starts with http or https
+      if (
+        streamUrl &&
+        typeof streamUrl === "string" &&
+        streamUrl.startsWith("http")
+      ) {
+        return streamUrl;
+        // if its an array, get the value that starts with http
+      } else if (Array.isArray(streamUrl)) {
+        const httpStream = streamUrl.find((url) => url.startsWith("http"));
+        if (httpStream) {
+          return httpStream;
+        }
+      } else if (streamUrl || typeof streamUrl !== "string") {
+        // check if it's a valid stream URL
+        return null;
+      }
+    } catch (error) {
+      // Ignore the error and try the next provider
+    }
+  }
+  return null;
+}
+
+async function multiExtractor(providers) {
+  /* this scheme should be returned as a JSON object
+  {
+  "streams": [
+  {
+    "title": "FileMoon",
+    "streamUrl": "https://filemoon.example/stream1.m3u8",
+  },
+  {
+    "title": "StreamWish",
+    "streamUrl": "https://streamwish.example/stream2.m3u8",
+  },
+  {
+    "title": "Okru",
+    "streamUrl": "https://okru.example/stream3.m3u8",
+    "headers": { // Optional headers for the stream
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+      "Referer": "https://okru.example/",
+    },
+  },
+  {
+    "title": "MP4",
+    "streamUrl": "https://mp4upload.example/stream4.mp4",
+  },
+  {
+    "title": "Default",
+    "streamUrl": "https://default.example/stream5.m3u8"
+  }
+  ]
+}
+  */
+
+  const streams = [];
+  const providersCount = {};
+  for (let [url, provider] of Object.entries(providers)) {
+    try {
+      // if provider starts with "direct-", then add the url to the streams array directly
+      if (provider.startsWith("direct-")) {
+        const directName = provider.slice(7); // remove "direct-" prefix
+        const title = (directName && directName.length > 0) ? directName : "Direct";
+        streams.push({
+          title: title,
+          streamUrl: url
+        });
+        continue; // skip to the next provider
+      }
+      if (provider.startsWith("direct")) {
+        provider = provider.slice(7); // remove "direct-" prefix
+        const title = (provider && provider.length > 0) ? provider : "Direct";
+        streams.push({
+          title: title,
+          streamUrl: url
+        });
+        continue; // skip to the next provider
+      }
+
+      let customName = null; // to store the custom name if provided
+
+      // if the provider has - then split it and use the first part as the provider name
+      if (provider.includes("-")) {
+        const parts = provider.split("-");
+        provider = parts[0]; // use the first part as the provider name
+        customName = parts.slice(1).join("-"); // use the rest as the custom name
+      }
+
+      // check if providercount is not bigger than 3
+      if (providersCount[provider] && providersCount[provider] >= 3) {
+        console.log(`Skipping ${provider} as it has already 3 streams`);
+        continue;
+      }
+      let result = await extractStreamUrlByProvider(url, provider);
+      let streamUrl = null;
+      let headers = null;
+
+      // Check if result is an object with streamUrl and optional headers
+      if (result && typeof result === "object" && !Array.isArray(result) && result.streamUrl) {
+        streamUrl = result.streamUrl;
+        headers = result.headers || null;
+      } else if (result && Array.isArray(result)) {
+        const httpStream = result.find((url) => url.startsWith("http"));
+        if (httpStream) {
+          streamUrl = httpStream;
+        }
+      } else if (result && typeof result === "string") {
+        streamUrl = result;
+      }
+
+      // check if streamUrl is valid
+      if (
+        !streamUrl ||
+        typeof streamUrl !== "string" ||
+        !streamUrl.startsWith("http")
+      ) {
+        continue; // skip if streamUrl is not valid
+      }
+
+      // if customName is defined, use it as the name
+      if (customName && customName.length > 0) {
+        provider = customName;
+      }
+
+      let title;
+      if (providersCount[provider]) {
+        providersCount[provider]++;
+        title = provider.charAt(0).toUpperCase() +
+            provider.slice(1) +
+            "-" +
+            (providersCount[provider] - 1); // add a number to the provider name
+      } else {
+        providersCount[provider] = 1;
+        title = provider.charAt(0).toUpperCase() + provider.slice(1);
+      }
+      
+      const streamObject = {
+        title: title,
+        streamUrl: streamUrl
+      };
+      
+      // Add headers if they exist
+      if (headers && typeof headers === "object" && Object.keys(headers).length > 0) {
+        streamObject.headers = headers;
+      }
+      
+      streams.push(streamObject);
+    } catch (error) {
+      // Ignore the error and try the next provider
+    }
+  }
+  return streams;
+}
+
+async function extractStreamUrlByProvider(url, provider) {
+  if (eval(`typeof ${provider}Extractor`) !== "function") {
+    // skip if the extractor is not defined
+    console.log(
+      `Extractor for provider ${provider} is not defined, skipping...`
+    );
+    return null;
+  }
+  let uas = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 11; Pixel 4 XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Mobile Safari/537.36",
+  ];
+  let headers = {
+    "User-Agent": uas[(url.length + provider.length) % uas.length], // use a different user agent based on the url and provider
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer": url,
+    "Connection": "keep-alive",
+    "x-Requested-With": "XMLHttpRequest",
+  };
+
+  switch (provider) {
+    case "bigwarp":
+      delete headers["User-Agent"];
+      break;
+    case "vk":
+    case "sibnet":
+      headers["encoding"] = "windows-1251"; // required
+      break;
+    case "supervideo":
+    case "savefiles":
+        headers = {
+          "Accept": "*/*",
+          "Accept-Encoding": "gzip, deflate, br",
+          "User-Agent": "EchoapiRuntime/1.1.0",
+          "Connection": "keep-alive",
+          "Cache-Control": "no-cache",
+          "Host": url.match(/https?:\/\/([^\/]+)/)[1],
+        };
+      break;
+    case "streamtape":
+      headers = {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      };
+      break;
+  }
+  // console.log("Using headers: " + JSON.stringify(headers));
+
+  // fetch the url
+  // and pass the response to the extractor function
+  console.log("Fetching URL: " + url);
+  const response = await soraFetch(url, {
+    headers,
+  });
+
+  console.log("Response: " + response.status);
+  let html = response.text ? await response.text() : response;
+  // if title contains redirect, then get the redirect url
+  const title = html.match(/<title>(.*?)<\/title>/);
+  if (title && title[1].toLowerCase().includes("redirect")) {
+    const matches = [
+      /<meta http-equiv="refresh" content="0;url=(.*?)"/,
+      /window\.location\.href\s*=\s*["'](.*?)["']/,
+      /window\.location\.replace\s*\(\s*["'](.*?)["']\s*\)/,
+      /window\.location\s*=\s*["'](.*?)["']/,
+      /window\.location\.assign\s*\(\s*["'](.*?)["']\s*\)/,
+      /top\.location\s*=\s*["'](.*?)["']/,
+      /top\.location\.replace\s*\(\s*["'](.*?)["']\s*\)/,
+    ];
+    for (const match of matches) {
+      const redirectUrl = html.match(match);
+      if (redirectUrl && redirectUrl[1] && typeof redirectUrl[1] === "string" && redirectUrl[1].startsWith("http")) {
+        console.log("Redirect URL found: " + redirectUrl[1]);
+        url = redirectUrl[1];
+        headers['Referer'] = url;
+        headers['Host'] = url.match(/https?:\/\/([^\/]+)/)[1];
+        html = await soraFetch(url, {
+          headers,
+        }).then((res) => res.text());
+        break;
+      }
+    }
+  }
+
+  // console.log("HTML: " + html);
+  switch (provider) {
+        case "doodstream":
+      try {
+         return await doodstreamExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from doodstream:", error);
+         return null;
+      }
+    case "earnvids":
+      try {
+         return await earnvidsExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from earnvids:", error);
+         return null;
+      }
+    case "mp4upload":
+      try {
+         return await mp4uploadExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from mp4upload:", error);
+         return null;
+      }
+    case "packer":
+      try {
+         return await packerExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from packer:", error);
+         return null;
+      }
+    case "sendvid":
+      try {
+         return await sendvidExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from sendvid:", error);
+         return null;
+      }
+    case "sibnet":
+      try {
+         return await sibnetExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from sibnet:", error);
+         return null;
+      }
+    case "streamtape":
+      try {
+         return await streamtapeExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from streamtape:", error);
+         return null;
+      }
+    case "uqload":
+      try {
+         return await uqloadExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from uqload:", error);
+         return null;
+      }
+    case "videospk":
+      try {
+         return await videospkExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from videospk:", error);
+         return null;
+      }
+    case "vidmoly":
+      try {
+         return await vidmolyExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from vidmoly:", error);
+         return null;
+      }
+    case "vidoza":
+      try {
+         return await vidozaExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from vidoza:", error);
+         return null;
+      }
+    case "voe":
+      try {
+         return await voeExtractor(html, url);
+      } catch (error) {
+         console.log("Error extracting stream URL from voe:", error);
+         return null;
+      }
+
+    default:
+      throw new Error(`Unknown provider: ${provider}`);
+  }
+}
+
+////////////////////////////////////////////////
+//                 EXTRACTORS                 //
+////////////////////////////////////////////////
+
+// DO NOT EDIT BELOW THIS LINE UNLESS YOU KNOW WHAT YOU ARE DOING //
+/* --- doodstream --- */
+
+/**
+ * @name doodstreamExtractor
+ * @author Cufiy
+ */
+async function doodstreamExtractor(html, url = null) {
+    console.log("DoodStream extractor called");
+    console.log("DoodStream extractor URL: " + url);
+    const match = html.match(/\/pass_md5\/([a-fA-F0-9\-]+)\/([a-zA-Z0-9]+)/);
+    if (!match) {
+        console.log('Could not find hash/token in the page.');
+        return;
+    }
+    const hash = match[1];
+    const token = match[2];
+    console.log('🔑 Hash:', hash, 'Token:', token);
+    const hostUrl = url.match(/https?:\/\/[^\/]+/)[0];
+    // 2. Request the base video URL
+    const request = await soraFetch(`${hostUrl}/pass_md5/${hash}/${token}`);
+    if (!request) {
+        console.error('Failed to fetch the base video URL.');
+        return;
+    }
+    const data = await request.text();
+
+    if (!data) {
+        console.error('Failed to fetch the base video URL.');
+        return;
+    }
+    if (data.trim() === 'RELOAD') {
+        console.error('Token expired or invalid. Received RELOAD response.');
+        return;
+    }
+    let baseUrl = data.trim();
+    // If the server returns a relative path, make it absolute
+    if (!baseUrl.startsWith('http')) {
+        baseUrl = hostUrl + baseUrl;
+    }
+    console.log('🎬 Base video URL:', baseUrl);
+    // 3. Replicate makePlay() – random 10 chars + token + expiry
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let randomStr = '';
+    for (let i = 0; i < 10; i++) {
+        randomStr += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    const suffix = randomStr + '?token=' + token + '&expiry=' + Date.now();
+    const finalUrl = baseUrl + suffix;
+    console.log('Final video URL:', finalUrl);
+    return finalUrl;
+}
+/* --- earnvids --- */
+
+/* {REQUIRED PLUGINS: unbaser} */
+/**
+ * @name earnvidsExtractor
+ * @author 50/50
+ */
+async function earnvidsExtractor(html, url = null) {
+    try {
+        const obfuscatedScript = html.match(/<script[^>]*>\s*(eval\(function\(p,a,c,k,e,d.*?\)[\s\S]*?)<\/script>/);
+        const unpackedScript = unpack(obfuscatedScript[1]);
+        const streamMatch = unpackedScript.match(/["'](\/stream\/[^"']+)["']/);
+        const hlsLink = streamMatch ? streamMatch[1] : null;
+        const baseUrl = url.match(/^(https?:\/\/[^/]+)/)[1];
+        console.log("HLS Link:" + baseUrl + hlsLink);
+        return baseUrl + hlsLink;
+    } catch (err) {
+        console.log(err);
+        return null;
+    }
+}
+
+/* --- mp4upload --- */
+
+/**
+ * @name mp4uploadExtractor
+ * @author Cufiy
+ */
+async function mp4uploadExtractor(html, url = null) {
+    const regex = /src:\s*"([^"]+)"/;
+  const match = html.match(regex);
+  if (match) {
+    return match[1];
+  } else {
+    console.log("No match found for mp4upload extractor");
+    return null;
+  }
+}
+/* --- packer --- */
+
+/* {REQUIRED PLUGINS: unbaser} */
+/**
+ * @name packerExtractor
+ * @author 50/50
+ */
+async function packerExtractor(data, url = null) {
+    const obfuscatedScript = data.match(/<script[^>]*>\s*(eval\(function\(p,a,c,k,e,d.*?\)[\s\S]*?)<\/script>/);
+    const unpackedScript = unpack(obfuscatedScript[1]);
+    const m3u8Match = unpackedScript.match(/"hls2"\s*:\s*"([^"]+)"/);
+    const m3u8Url = m3u8Match[1];
+    return m3u8Url;
+}
+
+/* --- sendvid --- */
+
+/**
+ * @name sendvidExtractor
+ * @author 50/50
+ */
+async function sendvidExtractor(data, url = null) {
+    const match = data.match(/var\s+video_source\s*=\s*"([^"]+)"/);
+    const videoUrl = match ? match[1] : null;
+    return videoUrl;
+}
+/* --- sibnet --- */
+
+/**
+ * @name sibnetExtractor
+ * @author scigward
+ */
+async function sibnetExtractor(html, embedUrl) {
+    try {
+        const videoMatch = html.match(
+            /player\.src\s*\(\s*\[\s*\{\s*src\s*:\s*["']([^"']+)["']/i
+        );
+        if (!videoMatch || !videoMatch[1]) {
+            throw new Error("Sibnet video source not found");
+        }
+        const videoPath = videoMatch[1];
+        const videoUrl = videoPath.startsWith("http")
+            ? videoPath
+            : `https://video.sibnet.ru${videoPath}`;
+        return videoUrl;
+    } catch (error) {
+        console.log("SibNet extractor error: " + error.message);
+        return null;
+    }
+}
+/* --- streamtape --- */
+
+/**
+ * 
+ * @name streamTapeExtractor
+ * @author ShadeOfChaos
+ */
+async function streamtapeExtractor(html, url) {
+    let promises = [];
+    const LINK_REGEX = /link['"]{1}\).innerHTML *= *['"]{1}([\s\S]*?)["'][\s\S]*?\(["']([\s\S]*?)["']([\s\S]*?);/g;
+    const CHANGES_REGEX = /([0-9]+)/g;
+    if(html == null) {
+        if(url == null) {
+            throw new Error('Provided incorrect parameters.');
+        }
+        const response = await soraFetch(url);
+        html = await response.text();
+    }
+    const matches = html.matchAll(LINK_REGEX);
+    for (const match of matches) {
+        let base = match?.[1];
+        let params = match?.[2];
+        const changeStr = match?.[3];
+        if(changeStr == null || changeStr == '') continue;
+        const changes = changeStr.match(CHANGES_REGEX);
+        for(let n of changes) {
+            params = params.substring(n);
+        }
+        while(base[0] == '/') {
+            base = base.substring(1);
+        }
+        const url = 'https://' + base + params;
+        promises.push(testUrl(url));
+    }
+    // Race for first success
+    return Promise.any(promises).then((value) => {
+        return value;
+    }).catch((error) => {
+        return null;
+    });
+    async function testUrl(url) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Timeout version prefered, but Sora does not support it currently
+                // var response = await soraFetch(url, { method: 'GET', signal: AbortSignal.timeout(2000) });
+                var response = await soraFetch(url);
+                if(response == null) throw new Error('Connection timed out.');
+            } catch(e) {
+                console.error('Rejected due to:', e.message);
+                return reject(null);
+            }
+            if(response?.ok && response?.status === 200) {
+                return resolve(url);
+            }
+            console.warn('Reject because of response:', response?.ok, response?.status);
+            return reject(null);
+        });
+    }
+}
+/* --- uqload --- */
+
+/**
+ * @name uqloadExtractor
+ * @author scigward
+ */
+async function uqloadExtractor(html, embedUrl) {
+    try {
+        const match = html.match(/sources:\s*\[\s*"([^"]+\.mp4)"\s*\]/);
+        const videoSrc = match ? match[1] : "";
+        return videoSrc;
+    } catch (error) {
+        console.log("uqloadExtractor error:", error.message);
+        return null;
+    }
+}
+/* --- videospk --- */
+
+/* {REQUIRED PLUGINS: unbaser} */
+/**
+ * @name videospkExtractor
+ * @author 50/50
+ */
+async function videospkExtractor(data, url = null) {
+        const obfuscatedScript = data.match(/<script[^>]*>\s*(eval\(function\(p,a,c,k,e,d.*?\)[\s\S]*?)<\/script>/);
+        const unpackedScript = unpack(obfuscatedScript[1]);
+        const streamMatch = unpackedScript.match(/["'](\/stream\/[^"']+)["']/);
+        const hlsLink = streamMatch ? streamMatch[1] : null;
+        return "https://videospk.xyz" + hlsLink;
+}
+
+/* --- vidmoly --- */
+
+/**
+ * @name vidmolyExtractor
+ * @author Ibro
+ */
+async function vidmolyExtractor(html, url = null) {
+  const regexSub = /<option value="([^"]+)"[^>]*>\s*SUB - Omega\s*<\/option>/;
+  const regexFallback = /<option value="([^"]+)"[^>]*>\s*Omega\s*<\/option>/;
+  const fallback =
+    /<option value="([^"]+)"[^>]*>\s*SUB v2 - Omega\s*<\/option>/;
+  let match =
+    html.match(regexSub) || html.match(regexFallback) || html.match(fallback);
+  if (match) {
+    const decodedHtml = atob(match[1]); // Decode base64
+    const iframeMatch = decodedHtml.match(/<iframe\s+src="([^"]+)"/);
+    if (!iframeMatch) {
+      console.log("Vidmoly extractor: No iframe match found");
+      return null;
+    }
+    const streamUrl = iframeMatch[1].startsWith("//")
+      ? "https:" + iframeMatch[1]
+      : iframeMatch[1];
+    let uas = [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Mobile/15E148 Safari/604.1",
+      "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Mobile Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15",
+      "Mozilla/5.0 (Linux; Android 11; Pixel 4 XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Mobile Safari/537.36",
+    ];
+    let headers = {
+      "User-Agent": uas[(url.length) % uas.length], // use a different user agent based on the url and provider
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Referer": url,
+      "Connection": "keep-alive",
+      "x-Requested-With": "XMLHttpRequest",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-User": "?1",
+    };
+    const response = await soraFetch(url, { headers });
+    html = await response.text();
+  } 
+    console.log("Vidmoly extractor: No match found, using fallback");
+    //  regex the sources: [{file:"this_is_the_link"}]
+    const sourcesRegex = /sources:\s*\[\s*\{\s*file:\s*['"](https?:\/\/[^'"]+)['"]\s*\}/;
+    const sourcesMatch = html.match(sourcesRegex);
+    let sourcesString = sourcesMatch
+      ? sourcesMatch[1].replace(/'/g, '"')
+      : null;
+    return sourcesString;
+  
+}
+/* --- vidoza --- */
+
+/**
+ * @name vidozaExtractor
+ * @author Cufiy
+ */
+async function vidozaExtractor(html, url = null) {
+  const regex = /<source src="([^"]+)" type='video\/mp4'>/;
+  const match = html.match(regex);
+  if (match) {
+    return match[1];
+  } else {
+    console.log("No match found for vidoza extractor");
+    return null;
+  }
+}
+/* --- voe --- */
+
+/**
+ * @name voeExtractor
+ * @author Cufiy
+ *
+ * Ported from the filmo.to addon. VOE hides the real stream URLs in a single
+ * obfuscated JSON array and can expose several of them (HLS master + direct
+ * MP4 + fallback mirrors). We decode the payload once and hand every candidate
+ * to the player, because which one is usable varies per file.
+ */
+function voeExtractStreams(html, url = null) {
+  const result = voeDecodePage(html);
+  const candidates = [];
+
+  const addCandidate = function (value) {
+    if (typeof value !== "string") return;
+    const cleaned = unescapeUrl(value);
+    if (!/^https?:\/\//i.test(cleaned)) return;
+    if (!/\.(?:m3u8|mp4)(?:\?|$)/i.test(cleaned)) return;
+    // Skip VOE's decoy/test video and ad URLs.
+    if (/test-videos\.co\.uk|bigbuckbunny|doubleclick|googlesyndication|adservice|analytics/i.test(cleaned)) return;
+    if (candidates.indexOf(cleaned) === -1) candidates.push(cleaned);
+  };
+
+  const collect = function (value) {
+    if (!value) return;
+    if (typeof value === "string") return addCandidate(value);
+    if (Array.isArray(value)) { value.forEach(collect); return; }
+    if (typeof value === "object") {
+      collect(value.direct_access_url);
+      collect(value.file);
+      collect(value.url);
+      collect(value.src);
+      collect(value.source);
+    }
+  };
+
+  if (result) {
+    collect(result.source);
+    collect(result.fallback);
+    collect(result.direct_access_url);
+  }
+
+  // Last resort: scan the raw HTML for a player URL.
+  if (candidates.length === 0 && html) {
+    const raw = unescapeUrl(html);
+    const urlRegex = /(https?:\/\/[^"'\s<>\\]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>\\]*)?)/gi;
+    let match;
+    while ((match = urlRegex.exec(raw)) !== null) addCandidate(match[1]);
+  }
+
+  // HLS first: iOS/Sora uses AVPlayer, which plays HLS natively. VOE serves
+  // the MP4 with `Content-Disposition: attachment`, and iOS treats that as a
+  // download instead of a stream (the filmo addon works on iOS precisely
+  // because it lists HLS first). MP4 stays as the second choice for players
+  // that prefer progressive files.
+  const mp4 = candidates.filter(function (value) { return isMp4Url(value); });
+  const hls = candidates.filter(function (value) { return !isMp4Url(value); });
+  const ordered = hls.concat(mp4);
+  const quality = voeQualityFromResult(result);
+
+  return ordered.map(function (streamUrl, index) {
+    return {
+      url: streamUrl,
+      index: index,
+      quality: quality,
+      format: isMp4Url(streamUrl) ? "MP4" : "HLS"
+    };
+  });
+}
+
+function voeExtractor(html, url = null) {
+  const streams = voeExtractStreams(html, url);
+  if (streams.length > 0) {
+    console.log("Voe Stream URL: " + streams[0].url);
+    return streams[0].url;
+  }
+  console.log("No stream URL found in the decoded JSON");
+  return null;
+}
+
+function voeDecodePage(html) {
+  const jsonScriptMatch = String(html || "").match(
+    /<script[^>]+type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i
+  );
+  if (!jsonScriptMatch) {
+    console.log("No application/json script tag found");
+    return null;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(jsonScriptMatch[1].trim());
+  } catch (e) {
+    console.log("VOE: invalid JSON payload");
+    return null;
+  }
+  if (!Array.isArray(data) || typeof data[0] !== "string") {
+    console.log("VOE: unexpected payload shape");
+    return null;
+  }
+
+  try {
+    // ROT13 -> remove markers -> base64 -> shift -3 -> reverse -> base64 -> JSON
+    let value = voeRot13(data[0]);
+    value = voeRemovePatterns(value);
+    value = voeBase64Decode(value);
+    value = voeShiftChars(value, 3);
+    value = value.split("").reverse().join("");
+    value = voeBase64Decode(value);
+    return JSON.parse(value);
+  } catch (e) {
+    console.log("VOE decode failed: " + e);
+    return null;
+  }
+}
+
+function voeQualityFromResult(result) {
+  if (!result || typeof result !== "object") return "";
+  const title = typeof result.title === "string" ? result.title : "";
+  const match = /(?:^|[^0-9])(\d{3,4})\s*p(?:[^a-z]|$)/i.exec(title);
+  return match ? match[1] + "p" : "";
+}
+
+function isMp4Url(url) {
+  return /\.mp4(?:\?|$)/i.test(url) || /\/engine\/download\//i.test(url);
+}
+function voeRot13(str) {
+  return str.replace(/[a-zA-Z]/g, function (c) {
+    return String.fromCharCode(
+      (c <= "Z" ? 90 : 122) >= (c = c.charCodeAt(0) + 13)
+        ? c
+        : c - 26
+    );
+  });
+}
+function voeRemovePatterns(str) {
+  const patterns = ["@$", "^^", "~@", "%?", "*~", "!!", "#&"];
+  let result = str;
+  for (const pat of patterns) {
+    result = result.split(pat).join("");
+  }
+  return result;
+}
+function voeBase64Decode(str) {
+  let input = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (input.length % 4 !== 0) input += "=";
+  // atob is available in browsers, Sora's JS runtime and Node >= 16
+  if (typeof atob === "function") {
+    return atob(input);
+  }
+  // Node.js fallback
+  return Buffer.from(input, "base64").toString("utf-8");
+}
+function voeShiftChars(str, shift) {
+  return str
+    .split("")
+    .map((c) => String.fromCharCode(c.charCodeAt(0) - shift))
+    .join("");
+}
+
+
+////////////////////////////////////////////////
+//                 PLUGINS                    //
+////////////////////////////////////////////////
+
+/**
+ * Uses Sora's fetchv2 on ipad, fallbacks to regular fetch on Windows
+ * @author ShadeOfChaos
+ *
+ * @param {string} url The URL to make the request to.
+ * @param {object} [options] The options to use for the request.
+ * @param {object} [options.headers] The headers to send with the request.
+ * @param {string} [options.method='GET'] The method to use for the request.
+ * @param {string} [options.body=null] The body of the request.
+ *
+ * @returns {Promise<Response|null>} The response from the server, or null if the
+ * request failed.
+ */
+async function soraFetch(
+  url,
+  options = { headers: {}, method: "GET", body: null }
+) {
+  const headers = options.headers || {};
+  const method = options.method || "GET";
+  const body = options.body || null;
+
+  try {
+    if (typeof fetchv2 === "function") {
+      return await fetchv2(url, headers, method, body, true, options.encoding);
+    }
+  } catch (e) {
+    console.log("fetchv2 error: " + e);
+  }
+
+  try {
+    if (typeof fetch === "function") {
+      // Legacy Sora fetch(): headers are the second argument and the body is
+      // returned directly as a string.
+      return await fetch(url, headers);
+    }
+  } catch (error) {
+    console.log("soraFetch error: " + error);
+  }
+  return null;
+}
+/***********************************************************
+ * UNPACKER MODULE
+ * Credit to GitHub user "mnsrulz" for Unpacker Node library
+ * https://github.com/mnsrulz/unpacker
+ ***********************************************************/
+class Unbaser {
+    constructor(base) {
+        this.ALPHABET = {
+            62: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            95: "' !\"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'",
+        };
+        this.dictionary = {};
+        this.base = base;
+        if (36 < base && base < 62) {
+            this.ALPHABET[base] = this.ALPHABET[base] ||
+                this.ALPHABET[62].substr(0, base);
+        }
+        if (2 <= base && base <= 36) {
+            this.unbase = (value) => parseInt(value, base);
+        }
+        else {
+            try {
+                [...this.ALPHABET[base]].forEach((cipher, index) => {
+                    this.dictionary[cipher] = index;
+                });
+            }
+            catch (er) {
+                throw Error("Unsupported base encoding.");
+            }
+            this.unbase = this._dictunbaser;
+        }
+    }
+    _dictunbaser(value) {
+        let ret = 0;
+        [...value].reverse().forEach((cipher, index) => {
+            ret = ret + ((Math.pow(this.base, index)) * this.dictionary[cipher]);
+        });
+        return ret;
+    }
+}
+
+function detectUnbaser(source) {
+    /* Detects whether `source` is P.A.C.K.E.R. coded. */
+    return source.replace(" ", "").startsWith("eval(function(p,a,c,k,e,");
+}
+
+function unpack(source) {
+    let { payload, symtab, radix, count } = _filterargs(source);
+    if (count != symtab.length) {
+        throw Error("Malformed p.a.c.k.e.r. symtab.");
+    }
+    let unbase;
+    try {
+        unbase = new Unbaser(radix);
+    }
+    catch (e) {
+        throw Error("Unknown p.a.c.k.e.r. encoding.");
+    }
+    function lookup(match) {
+        const word = match;
+        let word2;
+        if (radix == 1) {
+            word2 = symtab[parseInt(word)];
+        }
+        else {
+            word2 = symtab[unbase.unbase(word)];
+        }
+        return word2 || word;
+    }
+    source = payload.replace(/\b\w+\b/g, lookup);
+    return _replacestrings(source);
+    function _filterargs(source) {
+        const juicers = [
+            /}\('(.*)', *(\d+|\[\]), *(\d+), *'(.*)'\.split\('\|'\), *(\d+), *(.*)\)\)/,
+            /}\('(.*)', *(\d+|\[\]), *(\d+), *'(.*)'\.split\('\|'\)/,
+        ];
+        for (const juicer of juicers) {
+            const args = juicer.exec(source);
+            if (args) {
+                let a = args;
+                if (a[2] == "[]") {
+                }
+                try {
+                    return {
+                        payload: a[1],
+                        symtab: a[4].split("|"),
+                        radix: parseInt(a[2]),
+                        count: parseInt(a[3]),
+                    };
+                }
+                catch (ValueError) {
+                    throw Error("Corrupted p.a.c.k.e.r. data.");
+                }
+            }
+        }
+        throw Error("Could not make sense of p.a.c.k.e.r data (unexpected code structure)");
+    }
+    function _replacestrings(source) {
+        return source;
+    }
+}
+
+
+/* {GE END} */
+
